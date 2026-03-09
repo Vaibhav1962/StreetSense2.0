@@ -3,7 +3,7 @@ import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { motion, AnimatePresence } from 'framer-motion';
 import { GitFork, Activity, ShieldAlert, Clock, RefreshCw, ChevronRight, Info } from 'lucide-react';
-import api from '../lib/api';
+import { api } from '../lib/api';
 import { toast } from 'sonner';
 
 interface ChokePoint {
