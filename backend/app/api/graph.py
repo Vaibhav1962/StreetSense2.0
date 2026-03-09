@@ -199,20 +199,30 @@ async def get_or_compute_graph_data(session: Session):
     cache_entry = session.exec(select(GraphCache).where(GraphCache.key == "delhi_graph")).first()
     if cache_entry and cache_entry.computed_at > datetime.utcnow() - timedelta(hours=24):
         try:
+            logger.info("Serving graph data from cache")
             data = json.loads(cache_entry.value)
             return data, True, (datetime.utcnow() - start_time).total_seconds()
         except:
             pass
 
     # Compute
-    logger.info("Building road graph from OpenStreetMap data...")
+    logger.info("--- Starting Graph Computation ---")
+    logger.info("Fetching road network from Overpass...")
     raw_data = await fetch_road_network()
     
-    # Run heavy computation in a thread to keep the event loop free
+    node_count = len([e for e in raw_data.get('elements', []) if e.get('type') == 'node'])
+    way_count = len([e for e in raw_data.get('elements', []) if e.get('type') == 'way'])
+    logger.info(f"Fetched {node_count} nodes and {way_count} ways")
+
+    # Run heavy computation in a thread
+    logger.info("Launching parallel background thread for algorithms...")
     result = await asyncio.to_thread(compute_everything, raw_data)
     
     if result is None:
+        logger.error("Graph computation returned None (invalid graph structure)")
         raise HTTPException(status_code=500, detail="Could not build a valid graph from OSM data.")
+    
+    logger.info(f"Computation complete in {(datetime.utcnow() - start_time).total_seconds():.2f}s")
     
     # Cache
     if cache_entry:
@@ -223,6 +233,7 @@ async def get_or_compute_graph_data(session: Session):
     
     session.add(cache_entry)
     session.commit()
+    logger.info("Result cached successfully")
     
     return result, False, (datetime.utcnow() - start_time).total_seconds()
 
