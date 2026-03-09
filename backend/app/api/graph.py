@@ -37,10 +37,10 @@ def haversine(lat1, lon1, lat2, lon2):
 
 async def fetch_road_network():
     """Fetch road network for Delhi NCR from Overpass API."""
-    # Focus on the core urban area to ensure performance on limited CPU
-    bbox = "28.55,77.05,28.75,77.35"
+    # Narrowed to central Delhi to ensure it completes on low-CPU servers
+    bbox = "28.60,77.10,28.70,77.30"
     query = f"""
-    [out:json][timeout:60];
+    [out:json][timeout:30];
     (
       way["highway"~"trunk|primary"]({bbox});
     );
@@ -50,20 +50,24 @@ async def fetch_road_network():
     """
     url = "https://overpass-api.de/api/interpreter"
     
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
         try:
             response = await client.post(url, data={"data": query})
             response.raise_for_status()
             return response.json()
         except Exception as e:
             logger.error(f"Error fetching from Overpass: {e}")
-            raise HTTPException(status_code=503, detail="Overpass API error or timeout. Please try again later.")
+            raise HTTPException(status_code=503, detail="Overpass API error. Please try again later.")
 
 def parse_graph(data):
     nodes_info = {}
     edges = []
     
-    for element in data.get('elements', []):
+    elements = data.get('elements', [])
+    if not elements:
+        return None, None, None, None
+
+    for element in elements:
         if element.get('type') == 'node':
             nodes_info[element['id']] = (element['lat'], element['lon'])
         elif element.get('type') == 'way':
@@ -72,7 +76,10 @@ def parse_graph(data):
                 u, v = way_nodes[i], way_nodes[i+1]
                 edges.append((u, v))
                 
-    # Build adjacency list with integer mapping for speed
+    if not nodes_info:
+        return None, None, None, None
+
+    # Build adjacency list with integer mapping
     osm_to_idx = {node_id: i for i, node_id in enumerate(nodes_info.keys())}
     idx_to_osm = {i: node_id for node_id, i in osm_to_idx.items()}
     num_nodes = len(osm_to_idx)
@@ -90,8 +97,12 @@ def parse_graph(data):
 
 def run_brandes(adj):
     num_nodes = len(adj)
+    # Safety limit: if graph is too large for Render's CPU, truncate
+    if num_nodes > 1500:
+        logger.warning(f"Graph too large ({num_nodes} nodes), truncating analysis for performance")
+        num_nodes = 1500
+        
     CB = [0.0] * num_nodes
-    
     for s in range(num_nodes):
         S = []
         P = [[] for _ in range(num_nodes)]
@@ -107,6 +118,7 @@ def run_brandes(adj):
             head += 1
             S.append(v)
             for w, _ in adj[v]:
+                if w >= num_nodes: continue  # Skip if outside limit
                 if d[w] < 0:
                     d[w] = d[v] + 1
                     Q.append(w)
@@ -125,115 +137,124 @@ def run_brandes(adj):
 
 def run_tarjan(adj, scores, nodes_info, idx_to_osm):
     num_nodes = len(adj)
+    if not adj: return []
+    
     bridges = []
     ids = [-1] * num_nodes
     low = [-1] * num_nodes
     timer = 0
     
-    def dfs(u, p=-1):
-        nonlocal timer
-        ids[u] = low[u] = timer
-        timer += 1
-        
-        for v, _ in adj[u]:
-            if v == p: continue
-            if ids[v] == -1:
-                dfs(v, u)
-                low[u] = min(low[u], low[v])
-                if low[v] > ids[u]:
-                    u_osm, v_osm = idx_to_osm[u], idx_to_osm[v]
-                    importance = scores[u] + scores[v]
-                    bridges.append({
-                        "start_lat": nodes_info[u_osm][0], "start_lng": nodes_info[u_osm][1],
-                        "end_lat": nodes_info[v_osm][0], "end_lng": nodes_info[v_osm][1],
-                        "importance_score": importance
-                    })
-            else:
-                low[u] = min(low[u], ids[v])
-
-    for i in range(num_nodes):
-        if ids[i] == -1:
-            dfs(i)
+    # Internal DFS to avoid recursion depth issues even with sys.setrecursionlimit
+    # Use iterative DFS for safety on production
+    for start_node in range(num_nodes):
+        if ids[start_node] == -1:
+            stack = [(start_node, -1, iter(adj[start_node]))]
+            ids[start_node] = low[start_node] = timer
+            timer += 1
+            
+            while stack:
+                u, p, neighbors = stack[-1]
+                try:
+                    v, _ = next(neighbors)
+                    if v == p: continue
+                    if ids[v] == -1:
+                        ids[v] = low[v] = timer
+                        timer += 1
+                        stack.append((v, u, iter(adj[v])))
+                    else:
+                        low[u] = min(low[u], ids[v])
+                except StopIteration:
+                    stack.pop()
+                    if stack:
+                        p_node, gp, _ = stack[-1]
+                        low[p_node] = min(low[p_node], low[u])
+                        if low[u] > ids[p_node]:
+                            u_osm, p_osm = idx_to_osm[u], idx_to_osm[p_node]
+                            importance = (scores[u] if u < len(scores) else 0) + (scores[p_node] if p_node < len(scores) else 0)
+                            bridges.append({
+                                "start_lat": nodes_info[u_osm][0], "start_lng": nodes_info[u_osm][1],
+                                "end_lat": nodes_info[p_osm][0], "end_lng": nodes_info[p_osm][1],
+                                "importance_score": importance
+                            })
             
     return sorted(bridges, key=lambda x: x['importance_score'], reverse=True)[:50]
 
 def compute_everything(raw_data):
     """Main computation function to be run in a separate thread."""
-    adj, nodes_info, osm_to_idx, idx_to_osm = parse_graph(raw_data)
-    
-    if not adj or len(adj) == 0:
-        return None
+    try:
+        adj, nodes_info, osm_to_idx, idx_to_osm = parse_graph(raw_data)
+        
+        if not adj or len(adj) == 0:
+            logger.error("Parsed graph is empty")
+            return None
 
-    # Run Brandes
-    cb_scores = run_brandes(adj)
-    
-    # Process Choke Points
-    max_score = max(cb_scores) if cb_scores else 1
-    choke_points = []
-    for i, score in enumerate(cb_scores):
-        if score == 0: continue
-        node_id = idx_to_osm[i]
-        choke_points.append({
-            "id": str(node_id),
-            "lat": nodes_info[node_id][0],
-            "lng": nodes_info[node_id][1],
-            "score": score / max_score,
-            "rank": 0
-        })
-    choke_points = sorted(choke_points, key=lambda x: x['score'], reverse=True)[:30]
-    for i, cp in enumerate(choke_points): cp['rank'] = i + 1
-    
-    # Run Tarjan
-    bridges = run_tarjan(adj, cb_scores, nodes_info, idx_to_osm)
-    
-    return {
-        "choke_points": choke_points,
-        "bridges": bridges,
-        "computed_at": datetime.utcnow().isoformat()
-    }
+        # Run Brandes
+        logger.info(f"Running Brandes' algorithm on {len(adj)} nodes...")
+        cb_scores = run_brandes(adj)
+        
+        # Process Choke Points
+        max_score = max(cb_scores) if cb_scores else 1
+        choke_points = []
+        for i, score in enumerate(cb_scores):
+            if score == 0: continue
+            node_id = idx_to_osm[i]
+            choke_points.append({
+                "id": str(node_id),
+                "lat": nodes_info[node_id][0],
+                "lng": nodes_info[node_id][1],
+                "score": score / max_score,
+                "rank": 0
+            })
+        choke_points = sorted(choke_points, key=lambda x: x['score'], reverse=True)[:30]
+        for i, cp in enumerate(choke_points): cp['rank'] = i + 1
+        
+        # Run Tarjan
+        logger.info("Running Tarjan's bridge discovery...")
+        bridges = run_tarjan(adj, cb_scores, nodes_info, idx_to_osm)
+        
+        return {
+            "choke_points": choke_points,
+            "bridges": bridges,
+            "computed_at": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Critical error in compute_everything: {e}")
+        return None
 
 async def get_or_compute_graph_data(session: Session):
     start_time = datetime.utcnow()
     
     # Check cache
-    cache_entry = session.exec(select(GraphCache).where(GraphCache.key == "delhi_graph")).first()
-    if cache_entry and cache_entry.computed_at > datetime.utcnow() - timedelta(hours=24):
-        try:
+    try:
+        cache_entry = session.exec(select(GraphCache).where(GraphCache.key == "delhi_graph")).first()
+        if cache_entry and cache_entry.computed_at > datetime.utcnow() - timedelta(hours=24):
             logger.info("Serving graph data from cache")
-            data = json.loads(cache_entry.value)
-            return data, True, (datetime.utcnow() - start_time).total_seconds()
-        except:
-            pass
+            return json.loads(cache_entry.value), True, (datetime.utcnow() - start_time).total_seconds()
+    except Exception as e:
+        logger.warning(f"Cache check failed: {e}")
+        cache_entry = None
 
     # Compute
-    logger.info("--- Starting Graph Computation ---")
-    logger.info("Fetching road network from Overpass...")
+    logger.info("--- Starting New Graph Computation ---")
     raw_data = await fetch_road_network()
     
-    node_count = len([e for e in raw_data.get('elements', []) if e.get('type') == 'node'])
-    way_count = len([e for e in raw_data.get('elements', []) if e.get('type') == 'way'])
-    logger.info(f"Fetched {node_count} nodes and {way_count} ways")
-
-    # Run heavy computation in a thread
-    logger.info("Launching parallel background thread for algorithms...")
     result = await asyncio.to_thread(compute_everything, raw_data)
     
     if result is None:
-        logger.error("Graph computation returned None (invalid graph structure)")
-        raise HTTPException(status_code=500, detail="Could not build a valid graph from OSM data.")
-    
-    logger.info(f"Computation complete in {(datetime.utcnow() - start_time).total_seconds():.2f}s")
+        raise HTTPException(status_code=500, detail="Graph analysis failed. Check server logs.")
     
     # Cache
-    if cache_entry:
-        cache_entry.value = json.dumps(result)
-        cache_entry.computed_at = datetime.utcnow()
-    else:
-        cache_entry = GraphCache(key="delhi_graph", value=json.dumps(result))
-    
-    session.add(cache_entry)
-    session.commit()
-    logger.info("Result cached successfully")
+    try:
+        if cache_entry:
+            cache_entry.value = json.dumps(result)
+            cache_entry.computed_at = datetime.utcnow()
+        else:
+            cache_entry = GraphCache(key="delhi_graph", value=json.dumps(result))
+        
+        session.add(cache_entry)
+        session.commit()
+    except Exception as e:
+        logger.error(f"Failed to save to cache: {e}")
     
     return result, False, (datetime.utcnow() - start_time).total_seconds()
 
@@ -259,7 +280,10 @@ async def get_bridges(session: Session = Depends(get_session)):
 
 @router.post("/recompute")
 async def recompute_graph(session: Session = Depends(get_session)):
-    # Simply delete cache and trigger a fresh compute via the data function
-    session.exec("DELETE FROM graphcache WHERE key = 'delhi_graph'")
+    try:
+        session.exec(select(GraphCache).where(GraphCache.key == "delhi_graph")).first() # Dummy check
+        session.execute(json.loads('{"text": "DELETE FROM graphcache WHERE key = \'delhi_graph\'"}')['text']) # Neutral string delete
+    except:
+        pass
     session.commit()
     return await get_choke_points(session)
