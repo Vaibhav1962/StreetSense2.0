@@ -3,6 +3,7 @@ import asyncio
 import math
 import json
 import logging
+import sys
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional, Any
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +12,9 @@ from app.core.database import engine, get_session
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Increase recursion limit for deep road networks
+sys.setrecursionlimit(10000)
 
 # --- Models ---
 
@@ -33,7 +37,8 @@ def haversine(lat1, lon1, lat2, lon2):
 
 async def fetch_road_network():
     """Fetch road network for Delhi NCR from Overpass API."""
-    bbox = "28.4,76.8,28.85,77.6"
+    # Narrowed bbox to focus on the city and improve performance
+    bbox = "28.5,77.0,28.8,77.4"
     query = f"""
     [out:json][timeout:60];
     (
@@ -67,38 +72,35 @@ def parse_graph(data):
                 u, v = way_nodes[i], way_nodes[i+1]
                 edges.append((u, v))
                 
-    # Build adjacency list
-    adj = {}
-    for u, v in edges:
-        if u not in nodes_info or v not in nodes_info: continue
+    # Build adjacency list with integer mapping for speed
+    osm_to_idx = {node_id: i for i, node_id in enumerate(nodes_info.keys())}
+    idx_to_osm = {i: node_id for node_id, i in osm_to_idx.items()}
+    num_nodes = len(osm_to_idx)
+    
+    adj = [[] for _ in range(num_nodes)]
+    for u_osm, v_osm in edges:
+        if u_osm not in osm_to_idx or v_osm not in osm_to_idx: continue
+        u, v = osm_to_idx[u_osm], osm_to_idx[v_osm]
         
-        dist = haversine(nodes_info[u][0], nodes_info[u][1], nodes_info[v][0], nodes_info[v][1])
-        
-        if u not in adj: adj[u] = []
-        if v not in adj: adj[v] = []
+        dist = haversine(nodes_info[u_osm][0], nodes_info[u_osm][1], nodes_info[v_osm][0], nodes_info[v_osm][1])
         adj[u].append((v, dist))
         adj[v].append((u, dist))
         
-    return adj, nodes_info
+    return adj, nodes_info, osm_to_idx, idx_to_osm
 
-# --- Algorithms (From Scratch) ---
-
-def brandes_betweenness(adj, nodes_info):
-    """Brandes' algorithm for node betweenness centrality."""
-    CB = {v: 0.0 for v in adj}
+def run_brandes(adj):
+    num_nodes = len(adj)
+    CB = [0.0] * num_nodes
     
-    for s in adj:
-        # Step 1: Single-source shortest paths
-        S = []  # Stack
-        P = {v: [] for v in adj}  # Predecessors
-        sigma = {v: 0 for v in adj}
+    for s in range(num_nodes):
+        S = []
+        P = [[] for _ in range(num_nodes)]
+        sigma = [0] * num_nodes
         sigma[s] = 1
-        d = {v: -1 for v in adj}
+        d = [-1] * num_nodes
         d[s] = 0
         
-        Q = [s]  # Queue (BFS since we can treat it as unweighted for simplicity in road structure, 
-                 # or Dijkstra if we want distance-weighted, but standard betweenness often uses edge counts)
-        # Using BFS-style for pure connectivity centrality as described in many transport papers
+        Q = [s]
         head = 0
         while head < len(Q):
             v = Q[head]
@@ -112,22 +114,20 @@ def brandes_betweenness(adj, nodes_info):
                     sigma[w] += sigma[v]
                     P[w].append(v)
         
-        # Step 2: Accumulation
-        delta = {v: 0 for v in adj}
+        delta = [0.0] * num_nodes
         while S:
             w = S.pop()
             for v in P[w]:
-                delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w])
+                delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w])
             if w != s:
                 CB[w] += delta[w]
-                
     return CB
 
-def tarjan_bridges(adj, nodes_info, scores):
-    """Tarjan's algorithm for finding bridges."""
+def run_tarjan(adj, scores, nodes_info, idx_to_osm):
+    num_nodes = len(adj)
     bridges = []
-    ids = {v: -1 for v in adj}
-    low = {v: -1 for v in adj}
+    ids = [-1] * num_nodes
+    low = [-1] * num_nodes
     timer = 0
     
     def dfs(u, p=-1):
@@ -141,48 +141,38 @@ def tarjan_bridges(adj, nodes_info, scores):
                 dfs(v, u)
                 low[u] = min(low[u], low[v])
                 if low[v] > ids[u]:
-                    # Importance = sum of centrality of endpoints
-                    importance = scores.get(u, 0) + scores.get(v, 0)
+                    u_osm, v_osm = idx_to_osm[u], idx_to_osm[v]
+                    importance = scores[u] + scores[v]
                     bridges.append({
-                        "start_lat": nodes_info[u][0], "start_lng": nodes_info[u][1],
-                        "end_lat": nodes_info[v][0], "end_lng": nodes_info[v][1],
+                        "start_lat": nodes_info[u_osm][0], "start_lng": nodes_info[u_osm][1],
+                        "end_lat": nodes_info[v_osm][0], "end_lng": nodes_info[v_osm][1],
                         "importance_score": importance
                     })
             else:
                 low[u] = min(low[u], ids[v])
 
-    for node in adj:
-        if ids[node] == -1:
-            dfs(node)
+    for i in range(num_nodes):
+        if ids[i] == -1:
+            dfs(i)
             
     return sorted(bridges, key=lambda x: x['importance_score'], reverse=True)[:50]
 
-# --- API Implementation ---
-
-async def get_or_compute_graph_data(session: Session):
-    start_time = datetime.utcnow()
+def compute_everything(raw_data):
+    """Main computation function to be run in a separate thread."""
+    adj, nodes_info, osm_to_idx, idx_to_osm = parse_graph(raw_data)
     
-    # Check cache
-    cache_entry = session.exec(select(GraphCache).where(GraphCache.key == "delhi_graph")).first()
-    if cache_entry and cache_entry.computed_at > datetime.utcnow() - timedelta(hours=24):
-        data = json.loads(cache_entry.value)
-        return data, True, (datetime.utcnow() - start_time).total_seconds()
+    if not adj or len(adj) == 0:
+        return None
 
-    # Compute
-    logger.info("Building road graph from OpenStreetMap data...")
-    raw_data = await fetch_road_network()
-    adj, nodes_info = parse_graph(raw_data)
+    # Run Brandes
+    cb_scores = run_brandes(adj)
     
-    if not adj:
-        raise HTTPException(status_code=500, detail="Could not build a valid graph from OSM data.")
-
-    # Brandes
-    cb_scores = brandes_betweenness(adj, nodes_info)
-    
-    # Normalize and sort choke points
-    max_score = max(cb_scores.values()) if cb_scores else 1
+    # Process Choke Points
+    max_score = max(cb_scores) if cb_scores else 1
     choke_points = []
-    for node_id, score in cb_scores.items():
+    for i, score in enumerate(cb_scores):
+        if score == 0: continue
+        node_id = idx_to_osm[i]
         choke_points.append({
             "id": str(node_id),
             "lat": nodes_info[node_id][0],
@@ -193,14 +183,36 @@ async def get_or_compute_graph_data(session: Session):
     choke_points = sorted(choke_points, key=lambda x: x['score'], reverse=True)[:30]
     for i, cp in enumerate(choke_points): cp['rank'] = i + 1
     
-    # Bridges
-    bridges = tarjan_bridges(adj, nodes_info, cb_scores)
+    # Run Tarjan
+    bridges = run_tarjan(adj, cb_scores, nodes_info, idx_to_osm)
     
-    result = {
+    return {
         "choke_points": choke_points,
         "bridges": bridges,
         "computed_at": datetime.utcnow().isoformat()
     }
+
+async def get_or_compute_graph_data(session: Session):
+    start_time = datetime.utcnow()
+    
+    # Check cache
+    cache_entry = session.exec(select(GraphCache).where(GraphCache.key == "delhi_graph")).first()
+    if cache_entry and cache_entry.computed_at > datetime.utcnow() - timedelta(hours=24):
+        try:
+            data = json.loads(cache_entry.value)
+            return data, True, (datetime.utcnow() - start_time).total_seconds()
+        except:
+            pass
+
+    # Compute
+    logger.info("Building road graph from OpenStreetMap data...")
+    raw_data = await fetch_road_network()
+    
+    # Run heavy computation in a thread to keep the event loop free
+    result = await asyncio.to_thread(compute_everything, raw_data)
+    
+    if result is None:
+        raise HTTPException(status_code=500, detail="Could not build a valid graph from OSM data.")
     
     # Cache
     if cache_entry:
