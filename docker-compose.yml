@@ -1,0 +1,45 @@
+services:
+  backend:
+    build: ./backend
+    container_name: streetsense-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./data/streetsense.db
+      - SECRET_KEY=streetsense-production-secret-key-2024-delhi-ncr
+      - ACCESS_TOKEN_EXPIRE_MINUTES=10080
+      - MAPBOX_ACCESS_TOKEN=${MAPBOX_ACCESS_TOKEN:-}
+    volumes:
+      - backend_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    command: sh -c "python init_db.py && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    networks:
+      - streetsense-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: streetsense-web
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - streetsense-network
+
+volumes:
+  backend_data:
+    driver: local
+
+networks:
+  streetsense-network:
+    driver: bridge
