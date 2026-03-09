@@ -4,6 +4,7 @@ import axios from 'axios';
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '/api',
   headers: { 'Content-Type': 'application/json' },
+  timeout: 60000, // 60s timeout
 });
 
 // Attach JWT token to every request
