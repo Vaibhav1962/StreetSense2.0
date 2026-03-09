@@ -5,7 +5,7 @@ import logging
 import os
 
 from app.core.database import create_db_and_tables
-from app.api import auth, places, routing
+from app.api import auth, places, routing, graph
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(places.router, prefix="/api/places", tags=["Places"])
 app.include_router(routing.router, prefix="/api/routing", tags=["Routing"])
+app.include_router(graph.router, prefix="/api/graph", tags=["Graph Analysis"])
 
 
 @app.get("/health", tags=["Health"])

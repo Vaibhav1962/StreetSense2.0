@@ -1,5 +1,5 @@
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { Navigation2, AlertTriangle, Activity, LogOut, MapPin } from 'lucide-react';
+import { Navigation2, AlertTriangle, Activity, LogOut, MapPin, GitFork } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 
@@ -13,6 +13,7 @@ const navItems: NavItem[] = [
   { to: '/map', icon: <Navigation2 size={20} />, label: 'Navigate' },
   { to: '/emergency', icon: <AlertTriangle size={20} />, label: 'Emergency' },
   { to: '/jogging', icon: <Activity size={20} />, label: 'Jogging' },
+  { to: '/graph', icon: <GitFork size={20} />, label: 'Graph' },
 ];
 
 export default function Layout() {

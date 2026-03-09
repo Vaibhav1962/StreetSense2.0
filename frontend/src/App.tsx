@@ -6,6 +6,7 @@ import LoginPage from './pages/LoginPage';
 import MapPage from './pages/MapPage';
 import JoggingPage from './pages/JoggingPage';
 import EmergencyPage from './pages/EmergencyPage';
+import GraphPage from './pages/GraphPage';
 import Layout from './components/Layout';
 
 const queryClient = new QueryClient({
@@ -49,6 +50,7 @@ export default function App() {
             <Route path="map" element={<MapPage />} />
             <Route path="jogging" element={<JoggingPage />} />
             <Route path="emergency" element={<EmergencyPage />} />
+          <Route path="graph" element={<GraphPage />} />
           </Route>
           <Route path="*" element={<Navigate to="/map" replace />} />
         </Routes>
