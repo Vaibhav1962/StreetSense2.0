@@ -37,12 +37,12 @@ def haversine(lat1, lon1, lat2, lon2):
 
 async def fetch_road_network():
     """Fetch road network for Delhi NCR from Overpass API."""
-    # Narrowed bbox to focus on the city and improve performance
-    bbox = "28.5,77.0,28.8,77.4"
+    # Focus on the core urban area to ensure performance on limited CPU
+    bbox = "28.55,77.05,28.75,77.35"
     query = f"""
     [out:json][timeout:60];
     (
-      way["highway"~"trunk|primary|secondary"]({bbox});
+      way["highway"~"trunk|primary"]({bbox});
     );
     out body;
     >;
