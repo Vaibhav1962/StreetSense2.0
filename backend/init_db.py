@@ -10,6 +10,7 @@ os.makedirs("data", exist_ok=True)
 from app.core.database import create_db_and_tables, engine
 from app.core.security import get_password_hash
 from app.models.user import User
+from app.api.graph import GraphCache
 from sqlmodel import Session, select
 
 
